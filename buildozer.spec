@@ -1,11 +1,10 @@
 [app]
 p4a.branch = v2024.01.21
-android.ndk = 25b
 title = AMINIUM
 package.name = aminium
 package.domain = org.aminium
 source.dir = .
-source.include_exts = py,png,jpg,kv,json,java,sh,xml
+source.include_exts = py,png,jpg,kv,json
 version = 1.0
 requirements = python3,kivy==2.3.0,pyjnius,android,openssl,certifi
 orientation = portrait
@@ -17,6 +16,8 @@ android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,WAKE_LOCK,
 android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
+android.ndk = 25b
+android.ndk_api = 24
 android.accept_sdk_license = True
 android.add_src = java
 android.extra_manifest_application_arguments = ./manifest_app.xml
