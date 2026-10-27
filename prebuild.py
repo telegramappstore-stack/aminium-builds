@@ -19,8 +19,6 @@ if not os.path.exists(f"{OUT}/libusque.so"):
         "https://api.github.com/repos/Diniboy1123/usque/releases/latest", headers=hdr)))
     names = [a["name"] for a in rel["assets"]]
     cand = [a for a in rel["assets"] if "android" in a["name"].lower() and "arm64" in a["name"].lower()]
-    if not cand:  # fall back to the static linux/arm64 build (works on Android, needs a pasted config.json)
-        cand = [a for a in rel["assets"] if "linux" in a["name"].lower() and "arm64" in a["name"].lower()]
     if not cand:
         sys.exit("No android+arm64 asset in usque release. Assets: " + ", ".join(names))
     a = cand[0]
