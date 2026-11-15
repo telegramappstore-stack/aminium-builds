@@ -1,28 +1,41 @@
 [app]
-p4a.branch = master
-android.ndk = 25b
-title = AMINIUM
-package.name = aminium
+android.add_libs_arm64_v8a = libs/arm64-v8a/*.so
+android.extra_manifest_application_arguments = ./manifest_app.xml
+android.add_src = java
+p4a.branch = v2024.01.21
+title = Aminium Studio
+package.name = aminiumstudio
 package.domain = org.aminium
+
 source.dir = .
-source.include_exts = py,png,jpg,kv,json,java,sh,xml
-version = 1.0
-requirements = python3,kivy==2.3.0,pyjnius,android,openssl,certifi
+source.include_exts = py,png,jpg,kv,atlas,zip,json,txt,md
+# put aminium-pages.zip next to main.py before building so it ends up bundled in the APK
+source.include_patterns = aminium-pages.zip
+
+version = 1.0.0
+
+requirements = python3,kivy==2.3.0,requests,qrcode,certifi,pillow,pyjnius,urllib3,idna,charset-normalizer,android,openssl
+
 orientation = portrait
 fullscreen = 0
-icon.filename = %(source.dir)s/icon.png
-android.presplash_color = #05050f
 
-android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,WAKE_LOCK,FOREGROUND_SERVICE,POST_NOTIFICATIONS
+icon.filename = %(source.dir)s/icon.png
+
+android.permissions = INTERNET,ACCESS_NETWORK_STATE
+
+# Android 14 = API level 34
 android.api = 33
 android.minapi = 24
+android.ndk = 25b
 android.archs = arm64-v8a
-android.accept_sdk_license = True
-android.add_src = java
-android.extra_manifest_application_arguments = ./manifest_app.xml
 
-# the usque binary, renamed to libusque.so (see steps)
-android.add_libs_arm64_v8a = libs/arm64-v8a/*.so
+# release builds need these, see step_card below for how to use them
+#android.release_artifact = aab
+#android.keystore = %(source.dir)s/release.keystore
+#android.keyalias = aminium
+
+android.allow_backup = True
+android.accept_sdk_license = True
 
 [buildozer]
 log_level = 2
