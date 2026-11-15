@@ -1,29 +1,43 @@
 #!/usr/bin/env python3
 """
-Aminium Studio - Kivy / Android port.
+Aminium Studio - Kivy / Android app.
 
-Same four steps as the desktop app (Token -> Clean IPs -> Build -> Configs), plus the ONE
-feature this version adds: a "My configs" screen to manage every config ever built on this
-device (rename, delete locally, optionally also delete the Worker/Pages project on Cloudflare).
+Flow: Token -> Radar (clean IPs) -> Build -> Configs, plus "Saved" (everything built on this phone).
 
-All networking / scanning / Cloudflare / config-generation logic is unchanged from the desktop
-app - it lives in aminium_core.py and is simply called from here. This file only replaces the
-customtkinter UI with a Kivy UI that works on a phone.
+All networking / scanning / Cloudflare / config logic lives in aminium_core.py; this file is only UI:
+  * animated splash screen
+  * light, modern look (cards, gradient header, rounded inputs, bottom navigation)
+  * live RADAR animation while scanning for clean IPs (found IPs show up as glowing blips)
+  * one-tap "Create API token" button that opens Cloudflare's token page with every permission
+    Aminium needs already selected
 """
 import json
+import math
+import os
 import re
 import threading
-import time
 import uuid as uuidlib
+import zlib
+from pathlib import Path
 
+from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
+from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle, Triangle
+from kivy.graphics.texture import Texture
 from kivy.lang import Builder
-from kivy.properties import StringProperty, NumericProperty, BooleanProperty, ListProperty
-from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.metrics import dp
+from kivy.properties import BooleanProperty, ListProperty, NumericProperty, StringProperty
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.label import Label
 from kivy.uix.popup import Popup
+from kivy.uix.screenmanager import Screen, SlideTransition
+from kivy.uix.spinner import Spinner
+from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 import aminium_core as core
@@ -36,438 +50,1033 @@ if platform == "android":
     except Exception:
         pass
 
+# ───────────────────────────── palette ─────────────────────────────
+C_PRIMARY = (0.31, 0.275, 0.90, 1)
+C_CYAN = (0.02, 0.71, 0.83, 1)
+C_TEXT = (0.06, 0.09, 0.16, 1)
+C_MUTED = (0.39, 0.45, 0.55, 1)
+C_OK = (0.09, 0.64, 0.29, 1)
+C_ERR = (0.86, 0.20, 0.20, 1)
+
+TABS = [
+    ("token", "Token", "Step 1  -  Connect Cloudflare"),
+    ("scan", "Radar", "Step 2  -  Find clean IPs"),
+    ("build", "Build", "Step 3  -  Deploy your panel"),
+    ("output", "Configs", "Step 4  -  Your configs"),
+    ("manage", "Saved", "Everything you built on this phone"),
+]
+
+FORMATS_UI = [
+    ("auto", "Auto (recommended)", ""),
+    ("xray", "Xray + fragment", "?format=xray"),
+    ("clash", "Clash", "?format=clash"),
+    ("singbox", "sing-box", "?format=singbox"),
+    ("patt", "Patt", "?format=patt"),
+    ("v2ray", "Plain links", "?format=base64"),
+]
+
+
+def gradient_texture(c1, c2, vertical=True):
+    """Tiny 2-pixel texture that the GPU stretches into a smooth gradient."""
+    size = (1, 2) if vertical else (2, 1)
+    tex = Texture.create(size=size, colorfmt="rgba")
+    first, second = (c2, c1) if vertical else (c1, c2)   # texture row 0 is the bottom
+    buf = bytes(int(max(0, min(1, v)) * 255) for v in (*first, *second))
+    tex.blit_buffer(buf, colorfmt="rgba", bufferfmt="ubyte")
+    tex.mag_filter = "linear"
+    tex.min_filter = "linear"
+    return tex
+
+
+# ───────────────────────────── KV (layout + styles) ─────────────────────────────
 KV = r"""
 #:import dp kivy.metrics.dp
+#:set C_PRIMARY (0.31, 0.275, 0.90, 1)
+#:set C_CYAN (0.02, 0.71, 0.83, 1)
+#:set C_TEXT (0.06, 0.09, 0.16, 1)
+#:set C_MUTED (0.39, 0.45, 0.55, 1)
 
-<Card@BoxLayout>:
+<H1@Label>:
+    bold: True
+    font_size: "18sp"
+    color: C_TEXT
+    size_hint_y: None
+    height: self.texture_size[1] + dp(2)
+    halign: "left"
+    valign: "middle"
+    text_size: self.width, None
+
+<Body@Label>:
+    font_size: "13sp"
+    color: 0.20, 0.25, 0.35, 1
+    size_hint_y: None
+    height: self.texture_size[1] + dp(2)
+    halign: "left"
+    valign: "top"
+    text_size: self.width, None
+
+<Muted@Label>:
+    font_size: "12sp"
+    color: C_MUTED
+    size_hint_y: None
+    height: self.texture_size[1] + dp(2)
+    halign: "left"
+    valign: "top"
+    text_size: self.width, None
+
+<FieldLabel@Label>:
+    font_size: "12sp"
+    bold: True
+    color: C_MUTED
+    size_hint_y: None
+    height: dp(22)
+    halign: "left"
+    valign: "bottom"
+    text_size: self.width, self.height
+
+<Page>:
     orientation: "vertical"
     padding: dp(14)
-    spacing: dp(8)
+    spacing: dp(12)
+    size_hint_y: None
+    height: self.minimum_height
+
+<Card>:
+    orientation: "vertical"
+    padding: dp(16)
+    spacing: dp(10)
     size_hint_y: None
     height: self.minimum_height
     canvas.before:
         Color:
-            rgba: 0.071, 0.102, 0.212, 1
+            rgba: 0.06, 0.09, 0.20, 0.06
+        RoundedRectangle:
+            pos: self.x, self.y - dp(2)
+            size: self.size
+            radius: [dp(20)]
+        Color:
+            rgba: 1, 1, 1, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(20)]
+
+<RoundButton>:
+    size_hint_y: None
+    height: dp(48)
+    bold: True
+    font_size: "14sp"
+    color: self.fg
+    canvas.before:
+        Color:
+            rgba: self.bg_color
         RoundedRectangle:
             pos: self.pos
             size: self.size
             radius: [dp(14)]
 
-<SectionLabel@Label>:
-    bold: True
-    font_size: "16sp"
+<RoundInput>:
+    multiline: False
     size_hint_y: None
-    height: self.texture_size[1]
-    halign: "left"
-    valign: "middle"
-    text_size: self.width, None
-    color: 0.91, 0.925, 1, 1
-
-<SubLabel@Label>:
-    font_size: "12sp"
-    size_hint_y: None
-    height: self.texture_size[1]
-    halign: "left"
-    valign: "middle"
-    text_size: self.width, None
-    color: 0.56, 0.61, 0.78, 1
-
-<FieldLabel@Label>:
-    font_size: "13sp"
-    size_hint_y: None
-    height: dp(24)
-    halign: "left"
-    valign: "middle"
-    text_size: self.width, None
-    color: 0.72, 0.76, 0.9, 1
-
-<StepHeader@BoxLayout>:
-    size_hint_y: None
-    height: dp(56)
+    height: dp(46)
+    background_normal: ""
+    background_active: ""
+    background_disabled_normal: ""
+    background_color: 0, 0, 0, 0
+    foreground_color: C_TEXT
+    cursor_color: C_PRIMARY
+    hint_text_color: 0.6, 0.65, 0.75, 1
+    selection_color: 0.31, 0.275, 0.90, 0.25
+    font_size: "14sp"
+    padding: [dp(14), max(dp(10), (self.height - self.line_height) / 2)]
     canvas.before:
         Color:
-            rgba: 0.106, 0.157, 0.42, 1
+            rgba: (0.93, 0.94, 1, 1) if self.focus else (0.945, 0.953, 0.973, 1)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: C_PRIMARY if self.focus else (0.88, 0.90, 0.94, 1)
+        Line:
+            rounded_rectangle: self.x, self.y, self.width, self.height, dp(12)
+            width: dp(1.2) if self.focus else dp(1)
+
+<RoundSpinner>:
+    size_hint_y: None
+    height: dp(46)
+    background_normal: ""
+    background_down: ""
+    background_color: 0, 0, 0, 0
+    color: C_TEXT
+    font_size: "14sp"
+    halign: "left"
+    valign: "middle"
+    text_size: self.width - dp(46), self.height
+    padding_x: dp(14)
+    canvas.before:
+        Color:
+            rgba: 0.945, 0.953, 0.973, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+        Color:
+            rgba: 0.88, 0.90, 0.94, 1
+        Line:
+            rounded_rectangle: self.x, self.y, self.width, self.height, dp(12)
+            width: dp(1)
+        Color:
+            rgba: C_PRIMARY
+        Line:
+            points: self.right - dp(28), self.center_y + dp(3), self.right - dp(21), self.center_y - dp(4), self.right - dp(14), self.center_y + dp(3)
+            width: dp(1.5)
+
+<SpinnerOption>:
+    background_normal: ""
+    background_down: ""
+    background_color: (0.93, 0.94, 1, 1) if self.state == "down" else (1, 1, 1, 1)
+    color: C_TEXT
+    size_hint_y: None
+    height: dp(44)
+    font_size: "14sp"
+
+<SoftBar>:
+    size_hint_y: None
+    height: dp(8)
+    canvas:
+        Color:
+            rgba: 0.90, 0.92, 0.96, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(4)]
+        Color:
+            rgba: C_PRIMARY
+        RoundedRectangle:
+            pos: self.pos
+            size: max(self.height, self.width * min(1.0, self.value)), self.height
+            radius: [dp(4)]
+
+<StatBox>:
+    orientation: "vertical"
+    padding: dp(8)
+    canvas.before:
+        Color:
+            rgba: 1, 1, 1, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(16)]
+    Label:
+        text: root.value
+        bold: True
+        font_size: "20sp"
+        color: root.accent
+    Label:
+        text: root.caption
+        font_size: "10sp"
+        bold: True
+        color: C_MUTED
+
+<NavTab>:
+    font_size: "12sp"
+    bold: self.active
+    color: C_PRIMARY if self.active else C_MUTED
+    canvas.before:
+        Color:
+            rgba: (0.31, 0.275, 0.90, 0.10) if self.active else (0, 0, 0, 0)
+        RoundedRectangle:
+            pos: self.x + dp(6), self.y + dp(8)
+            size: self.width - dp(12), self.height - dp(16)
+            radius: [dp(14)]
+
+<IpRow>:
+    size_hint_y: None
+    height: dp(54)
+    padding: dp(12), dp(6)
+    spacing: dp(8)
+    canvas.before:
+        Color:
+            rgba: 0.945, 0.953, 0.973, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+    BoxLayout:
+        orientation: "vertical"
+        Label:
+            text: root.ip
+            bold: True
+            font_size: "14sp"
+            color: C_TEXT
+            halign: "left"
+            valign: "bottom"
+            text_size: self.size
+        Label:
+            text: root.meta
+            font_size: "11sp"
+            color: C_MUTED
+            halign: "left"
+            valign: "top"
+            text_size: self.size
+    Label:
+        text: str(root.score)
+        bold: True
+        font_size: "15sp"
+        size_hint_x: None
+        width: dp(46)
+        color: (0.09, 0.64, 0.29, 1) if root.score >= 70 else ((0.85, 0.55, 0.05, 1) if root.score >= 40 else (0.86, 0.20, 0.20, 1))
+        canvas.before:
+            Color:
+                rgba: (0.86, 0.97, 0.89, 1) if root.score >= 70 else ((1, 0.95, 0.82, 1) if root.score >= 40 else (1, 0.88, 0.88, 1))
+            RoundedRectangle:
+                pos: self.x, self.y + dp(8)
+                size: self.width, self.height - dp(16)
+                radius: [dp(10)]
+
+<DeployRow>:
+    BoxLayout:
+        size_hint_y: None
+        height: dp(22)
+        Label:
+            text: root.title
+            bold: True
+            font_size: "15sp"
+            color: C_TEXT
+            halign: "left"
+            valign: "middle"
+            shorten: True
+            text_size: self.size
+    Muted:
+        text: root.subtitle
+    BoxLayout:
+        size_hint_y: None
+        height: dp(40)
+        spacing: dp(8)
+        RoundButton:
+            text: "Load"
+            height: dp(40)
+            on_release: app.load_deployment(root.index)
+        RoundButton:
+            text: "Rename"
+            kind: "soft"
+            height: dp(40)
+            on_release: app.rename_deployment_prompt(root.index)
+        RoundButton:
+            text: "Delete"
+            kind: "danger"
+            height: dp(40)
+            on_release: app.delete_deployment_prompt(root.index)
+
+<LogBar>:
+    size_hint_y: None
+    height: dp(30)
+    padding: dp(14), 0
+    canvas.before:
+        Color:
+            rgba: 0.93, 0.94, 0.98, 1
         Rectangle:
             pos: self.pos
             size: self.size
     Label:
-        text: root.title if hasattr(root, "title") else ""
-        bold: True
-        font_size: "18sp"
+        id: lbl_log
+        text: root.last
+        font_size: "11sp"
+        color: C_MUTED
+        halign: "left"
+        valign: "middle"
+        shorten: True
+        text_size: self.size
 
-BoxLayout:
-    orientation: "vertical"
+<ToastLabel>:
+    size_hint: None, None
+    size: self.texture_size[0] + dp(32), self.texture_size[1] + dp(18)
+    pos_hint: {"center_x": .5, "y": .16}
+    font_size: "13sp"
+    color: 1, 1, 1, 1
     canvas.before:
         Color:
-            rgba: 0.039, 0.055, 0.122, 1
-        Rectangle:
+            rgba: 0.06, 0.09, 0.16, 0.92
+        RoundedRectangle:
             pos: self.pos
             size: self.size
+            radius: [dp(16)]
 
+<Radar>:
+    size_hint_y: None
+    height: min(self.width, dp(340))
+    Label:
+        text: root.title
+        bold: True
+        font_size: "13sp"
+        color: 0.55, 1, 0.88, 1
+        size_hint: None, None
+        size: self.texture_size
+        pos_hint: {"center_x": .5, "top": .975}
+    Label:
+        text: root.subtitle
+        font_size: "12sp"
+        color: 0.70, 0.80, 0.90, 1
+        size_hint: None, None
+        size: self.texture_size
+        pos_hint: {"center_x": .5, "y": .03}
+
+<Ring>:
+    size_hint: None, None
+    size: dp(150), dp(150)
+    pos_hint: {"center_x": .5}
+    Label:
+        text: root.text
+        bold: True
+        font_size: "26sp"
+        color: C_TEXT
+
+FloatLayout:
     BoxLayout:
-        size_hint_y: None
-        height: dp(52)
-        padding: dp(10), 0
+        orientation: "vertical"
         canvas.before:
             Color:
-                rgba: 0.106, 0.157, 0.42, 1
+                rgba: 0.957, 0.965, 0.984, 1
             Rectangle:
                 pos: self.pos
                 size: self.size
-        Label:
-            text: "AMINIUM STUDIO"
-            bold: True
-            font_size: "18sp"
-            halign: "left"
-            text_size: self.size
 
-    BoxLayout:
-        id: tabbar
-        size_hint_y: None
-        height: dp(44)
-        canvas.before:
-            Color:
-                rgba: 0.071, 0.102, 0.212, 1
-            Rectangle:
-                pos: self.pos
-                size: self.size
-        ToggleButton:
-            text: "1 Token"
-            group: "tabs"
-            state: "down"
-            on_press: app.goto("token")
-        ToggleButton:
-            text: "2 Clean IPs"
-            group: "tabs"
-            on_press: app.goto("scan")
-        ToggleButton:
-            text: "3 Build"
-            group: "tabs"
-            on_press: app.goto("build")
-        ToggleButton:
-            text: "4 Configs"
-            group: "tabs"
-            on_press: app.goto("output")
-        ToggleButton:
-            text: "My configs"
-            group: "tabs"
-            on_press: app.goto("manage")
-
-    ScreenManager:
-        id: sm
-
-    BoxLayout:
-        id: logbar
-        size_hint_y: None
-        height: dp(72)
-        padding: dp(8)
-        canvas.before:
-            Color:
-                rgba: 0.027, 0.039, 0.086, 1
-            Rectangle:
-                pos: self.pos
-                size: self.size
-        ScrollView:
+        GradientBox:
+            size_hint_y: None
+            height: dp(68)
+            padding: dp(16), dp(11)
+            spacing: dp(12)
             Label:
-                id: logbox
-                text: ""
-                size_hint_y: None
-                height: self.texture_size[1]
-                text_size: self.width, None
-                font_size: "11sp"
-                color: 0.56, 0.61, 0.78, 1
+                text: "A"
+                bold: True
+                font_size: "22sp"
+                size_hint_x: None
+                width: dp(46)
+                canvas.before:
+                    Color:
+                        rgba: 1, 1, 1, 0.24
+                    RoundedRectangle:
+                        pos: self.pos
+                        size: self.size
+                        radius: [dp(15)]
+            BoxLayout:
+                orientation: "vertical"
+                Label:
+                    text: "Aminium Studio"
+                    bold: True
+                    font_size: "19sp"
+                    halign: "left"
+                    valign: "bottom"
+                    text_size: self.size
+                Label:
+                    id: hdr_sub
+                    text: ""
+                    font_size: "12sp"
+                    color: 1, 1, 1, 0.85
+                    halign: "left"
+                    valign: "top"
+                    text_size: self.size
+
+        ScreenManager:
+            id: sm
+
+        LogBar:
+            id: logbar
+            on_release: app.show_log()
+
+        BoxLayout:
+            id: nav
+            size_hint_y: None
+            height: dp(60)
+            padding: dp(6), 0
+            canvas.before:
+                Color:
+                    rgba: 0.06, 0.09, 0.20, 0.07
+                Rectangle:
+                    pos: self.x, self.top
+                    size: self.width, dp(1.5)
+                Color:
+                    rgba: 1, 1, 1, 1
+                Rectangle:
+                    pos: self.pos
+                    size: self.size
 
 
 <TokenScreen>:
     name: "token"
     ScrollView:
-        BoxLayout:
-            orientation: "vertical"
-            padding: dp(12)
-            spacing: dp(10)
-            size_hint_y: None
-            height: self.minimum_height
+        bar_width: dp(3)
+        Page:
+            Card:
+                H1:
+                    text: "Connect Cloudflare"
+                Body:
+                    text: "One tap opens Cloudflare's token page with every permission Aminium needs already ticked. Press Continue, then Create Token, copy it and come back."
+                RoundButton:
+                    text: "Create API token (all permissions)"
+                    height: dp(52)
+                    on_release: app.open_token_page()
+                Muted:
+                    text: "Pre-selected:  Pages: Edit  |  Workers Scripts: Edit  |  Workers KV Storage: Edit  |  D1: Edit  |  Account Settings: Read  |  Account Analytics: Read  |  Zone: Read  |  DNS: Edit"
+                RoundButton:
+                    text: "Open the tokens page manually"
+                    kind: "soft"
+                    on_release: app.open_token_page(True)
 
             Card:
-                SectionLabel:
-                    text: "Step 1 - Cloudflare API token"
-                SubLabel:
-                    text: "Paste your Cloudflare API token once. It is stored only on this phone (app-private storage)."
+                H1:
+                    text: "Your token"
+                Muted:
+                    text: "Stored only on this phone (app-private storage)."
                 FieldLabel:
                     text: "API token (or Global API Key)"
-                TextInput:
-                    id: f_token
-                    multiline: False
-                    password: True
-                    size_hint_y: None
-                    height: dp(44)
-                FieldLabel:
-                    text: "Email (only needed for a Global API Key)"
-                TextInput:
-                    id: f_email
-                    multiline: False
-                    size_hint_y: None
-                    height: dp(44)
                 BoxLayout:
                     size_hint_y: None
-                    height: dp(44)
+                    height: dp(46)
                     spacing: dp(8)
-                    Button:
+                    RoundInput:
+                        id: f_token
+                        password: True
+                    RoundButton:
+                        text: "Paste"
+                        kind: "soft"
+                        height: dp(46)
+                        size_hint_x: None
+                        width: dp(84)
+                        on_release: app.paste_token()
+                FieldLabel:
+                    text: "Email (only for a Global API Key)"
+                RoundInput:
+                    id: f_email
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(48)
+                    spacing: dp(8)
+                    RoundButton:
                         text: "Save && verify"
                         on_release: app.on_save_token()
-                    Button:
+                    RoundButton:
                         text: "Forget token"
+                        kind: "danger"
                         on_release: app.on_forget_token()
                 Label:
                     id: lbl_token_state
                     text: ""
+                    font_size: "12sp"
+                    color: C_MUTED
                     size_hint_y: None
-                    height: dp(22)
+                    height: self.texture_size[1] + dp(4)
+                    halign: "left"
                     text_size: self.width, None
                 FieldLabel:
                     text: "Account"
-                Spinner:
+                RoundSpinner:
                     id: sp_account
                     text: "(verify token first)"
-                    size_hint_y: None
-                    height: dp(44)
 
 
 <ScanScreen>:
     name: "scan"
     ScrollView:
-        BoxLayout:
-            orientation: "vertical"
-            padding: dp(12)
-            spacing: dp(10)
-            size_hint_y: None
-            height: self.minimum_height
-
+        bar_width: dp(3)
+        Page:
+            Radar:
+                id: radar
+            BoxLayout:
+                size_hint_y: None
+                height: dp(64)
+                spacing: dp(10)
+                StatBox:
+                    id: st_tested
+                    caption: "TESTED"
+                StatBox:
+                    id: st_found
+                    caption: "CLEAN IPs"
+                    accent: 0.09, 0.64, 0.29, 1
+                StatBox:
+                    id: st_time
+                    caption: "SECONDS"
             Card:
-                SectionLabel:
-                    text: "Step 2 - find clean Cloudflare IPs"
-                SubLabel:
-                    text: "Run this with any VPN off. Each IP gets a real TCP + TLS + HTTP test."
+                SoftBar:
+                    id: pb_scan
+                Muted:
+                    id: lbl_scan_stats
+                    text: "Ready when you are. Turn any VPN off first."
                 FieldLabel:
                     text: "Connection"
-                Spinner:
+                RoundSpinner:
                     id: sp_conn
                     text: "TLS"
                     values: ["TLS", "No TLS"]
-                    size_hint_y: None
-                    height: dp(44)
                 FieldLabel:
                     text: "Search depth"
-                Spinner:
+                RoundSpinner:
                     id: sp_depth
                     text: "Normal"
                     values: ["Quick", "Normal", "Deep"]
+                BoxLayout:
                     size_hint_y: None
-                    height: dp(44)
-                Button:
-                    id: btn_scan
-                    text: "\u25b6  Start scan"
+                    height: dp(52)
+                    spacing: dp(8)
+                    RoundButton:
+                        id: btn_scan
+                        text: "Start scan"
+                        height: dp(52)
+                        on_release: app.on_scan()
+                    RoundButton:
+                        id: btn_stop
+                        text: "Stop"
+                        kind: "danger"
+                        height: dp(52)
+                        size_hint_x: None
+                        width: dp(100)
+                        disabled: True
+                        on_release: app.on_stop_scan()
+            Card:
+                H1:
+                    text: "Clean IPs"
+                Muted:
+                    id: lbl_ip_empty
+                    text: "(none yet)"
+                BoxLayout:
+                    id: ip_list
+                    orientation: "vertical"
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(6)
+                BoxLayout:
                     size_hint_y: None
                     height: dp(48)
-                    on_release: app.on_scan()
-                Button:
-                    id: btn_stop
-                    text: "Stop"
-                    size_hint_y: None
-                    height: dp(40)
-                    disabled: True
-                    on_release: app.on_stop_scan()
-                Label:
-                    id: lbl_scan_stats
-                    text: "idle"
-                    size_hint_y: None
-                    height: dp(24)
-                ProgressBar:
-                    id: pb_scan
-                    max: 1
-                    value: 0
-                    size_hint_y: None
-                    height: dp(16)
-
-            Card:
-                SectionLabel:
-                    text: "Clean IPs found"
-                Label:
-                    id: lbl_ip_list
-                    text: "(none yet)"
-                    size_hint_y: None
-                    height: self.texture_size[1]
-                    text_size: self.width, None
-                    font_size: "12sp"
+                    spacing: dp(8)
+                    RoundButton:
+                        text: "Copy all IPs"
+                        kind: "soft"
+                        on_release: app.copy_ips()
+                    RoundButton:
+                        text: "Continue to build"
+                        on_release: app.goto("build")
 
 
 <BuildScreen>:
     name: "build"
     ScrollView:
-        BoxLayout:
-            orientation: "vertical"
-            padding: dp(12)
-            spacing: dp(10)
-            size_hint_y: None
-            height: self.minimum_height
-
+        bar_width: dp(3)
+        Page:
             Card:
-                SectionLabel:
-                    text: "Step 3 - build"
-                Label:
+                H1:
+                    text: "Build your panel"
+                Body:
                     id: lbl_build_sum
                     text: ""
-                    size_hint_y: None
-                    height: self.texture_size[1]
-                    text_size: self.width, None
                 FieldLabel:
                     text: "Deploy to"
-                Spinner:
+                RoundSpinner:
                     id: sp_mode
                     text: "Workers (recommended)"
                     values: ["Workers (recommended)", "Pages (pages.dev)"]
-                    size_hint_y: None
-                    height: dp(44)
                 FieldLabel:
-                    text: "Source (_worker.js zip, e.g. aminium-pages.zip)"
+                    text: "Source zip (aminium-pages.zip)"
                 BoxLayout:
                     size_hint_y: None
-                    height: dp(44)
-                    spacing: dp(6)
-                    TextInput:
+                    height: dp(46)
+                    spacing: dp(8)
+                    RoundInput:
                         id: f_source
-                        multiline: False
-                    Button:
+                    RoundButton:
                         text: "Pick"
+                        kind: "soft"
+                        height: dp(46)
                         size_hint_x: None
-                        width: dp(70)
+                        width: dp(84)
                         on_release: app.pick_source_file()
                 FieldLabel:
                     text: "Project name"
-                TextInput:
+                RoundInput:
                     id: f_project
-                    multiline: False
-                    size_hint_y: None
-                    height: dp(44)
                 FieldLabel:
                     text: "ADMIN_PASSWORD"
-                TextInput:
+                RoundInput:
                     id: f_pass
-                    multiline: False
-                    size_hint_y: None
-                    height: dp(44)
                 FieldLabel:
                     text: "PANEL_PATH"
-                TextInput:
+                RoundInput:
                     id: f_panel
-                    multiline: False
-                    size_hint_y: None
-                    height: dp(44)
                 FieldLabel:
                     text: "Custom domain (optional)"
-                TextInput:
+                RoundInput:
                     id: f_domain
-                    multiline: False
-                    size_hint_y: None
-                    height: dp(44)
-                Button:
+                RoundButton:
                     text: "Re-roll random values"
-                    size_hint_y: None
-                    height: dp(40)
+                    kind: "soft"
                     on_release: app.roll_all()
-                Button:
-                    id: btn_build
-                    text: "\u26a1  Build my configs"
-                    size_hint_y: None
-                    height: dp(52)
-                    on_release: app.on_build()
+
+            Card:
+                Ring:
+                    id: ring
                 Label:
                     id: lbl_build_stage
                     text: "Waiting for you."
+                    font_size: "13sp"
+                    color: C_MUTED
                     size_hint_y: None
-                    height: self.texture_size[1]
+                    height: self.texture_size[1] + dp(4)
+                    halign: "center"
                     text_size: self.width, None
-                ProgressBar:
-                    id: pb_build
-                    max: 1
-                    value: 0
-                    size_hint_y: None
-                    height: dp(16)
+                RoundButton:
+                    id: btn_build
+                    text: "Build my configs"
+                    height: dp(54)
+                    on_release: app.on_build()
 
 
 <OutputScreen>:
     name: "output"
     ScrollView:
-        BoxLayout:
-            orientation: "vertical"
-            padding: dp(12)
-            spacing: dp(10)
-            size_hint_y: None
-            height: self.minimum_height
-
+        bar_width: dp(3)
+        Page:
             Card:
-                SectionLabel:
-                    text: "Step 4 - your configs"
-                Label:
+                H1:
+                    text: "Your configs"
+                Body:
                     id: lbl_out_info
-                    text: "Nothing built yet. Go through steps 1-3, or pick an earlier deployment in \"My configs\"."
-                    size_hint_y: None
-                    height: self.texture_size[1]
-                    text_size: self.width, None
+                    text: "Nothing built yet. Go through steps 1-3, or load one from the Saved tab."
                 FieldLabel:
                     text: "Format"
-                Spinner:
+                RoundSpinner:
                     id: sp_fmt
                     text: "Auto (recommended)"
                     values: ["Auto (recommended)", "Xray + fragment", "Clash", "sing-box", "Patt", "Plain links"]
-                    size_hint_y: None
-                    height: dp(44)
                     on_text: app.on_pick_fmt(self.text)
-                TextInput:
+                FieldLabel:
+                    text: "Subscription link"
+                RoundInput:
                     id: f_sub_url
-                    multiline: False
                     readonly: True
-                    size_hint_y: None
-                    height: dp(44)
                 BoxLayout:
                     size_hint_y: None
-                    height: dp(44)
-                    spacing: dp(6)
-                    Button:
+                    height: dp(48)
+                    spacing: dp(8)
+                    RoundButton:
                         text: "Copy link"
                         on_release: app.copy_sub_url()
-                    Button:
+                    RoundButton:
                         text: "Save all to device"
+                        kind: "soft"
                         on_release: app.save_all_configs()
-                TextInput:
+                FieldLabel:
+                    text: "Preview"
+                RoundInput:
                     id: f_preview
-                    text: ""
+                    multiline: True
                     readonly: True
-                    size_hint_y: None
-                    height: dp(220)
+                    height: dp(240)
+                    padding: [dp(14), dp(12)]
+                    font_size: "12sp"
 
 
 <ManageScreen>:
     name: "manage"
     BoxLayout:
         orientation: "vertical"
-        padding: dp(12)
-        spacing: dp(10)
+        padding: dp(14), dp(14), dp(14), 0
+        spacing: dp(12)
         Card:
-            size_hint_y: None
-            SectionLabel:
-                text: "My configs"
-            SubLabel:
-                text: "Every config you have built on this phone. Tap one to load it into Step 4, or delete it."
+            H1:
+                text: "Saved configs"
+            Muted:
+                text: "Everything you built on this phone. Load one back into the Configs tab, rename it, or remove it from the list."
         ScrollView:
+            bar_width: dp(3)
             BoxLayout:
                 id: manage_list
                 orientation: "vertical"
                 size_hint_y: None
                 height: self.minimum_height
-                spacing: dp(8)
-                padding: dp(4)
+                spacing: dp(12)
+                padding: 0, 0, 0, dp(14)
 """
+
+
+# ───────────────────────────── custom widgets ─────────────────────────────
+class Page(BoxLayout):
+    pass
+
+
+class Card(BoxLayout):
+    pass
+
+
+class RoundInput(TextInput):
+    pass
+
+
+class RoundSpinner(Spinner):
+    pass
+
+
+class RoundButton(ButtonBehavior, Label):
+    kind = StringProperty("primary")      # primary | soft | danger | ghost
+    bg_color = ListProperty([0.31, 0.275, 0.90, 1])
+    fg = ListProperty([1, 1, 1, 1])
+
+    _PALETTE = {
+        "primary": ((0.31, 0.275, 0.90, 1), (1, 1, 1, 1)),
+        "soft": ((0.90, 0.91, 1.0, 1), (0.31, 0.275, 0.90, 1)),
+        "danger": ((1.0, 0.90, 0.90, 1), (0.80, 0.12, 0.12, 1)),
+        "ghost": ((0, 0, 0, 0), (0.39, 0.45, 0.55, 1)),
+    }
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.halign = "center"
+        self.valign = "middle"
+        self.bind(kind=self._recalc, state=self._recalc, disabled=self._recalc)
+        self._recalc()
+
+    def _recalc(self, *_):
+        bg, fg = self._PALETTE.get(self.kind, self._PALETTE["primary"])
+        if self.disabled:
+            bg, fg = (0.89, 0.91, 0.94, 1), (0.62, 0.66, 0.72, 1)
+        elif self.state == "down":
+            bg = (bg[0] * 0.86, bg[1] * 0.86, bg[2] * 0.86, bg[3])
+        self.bg_color = list(bg)
+        self.fg = list(fg)
+
+
+class NavTab(ButtonBehavior, Label):
+    active = BooleanProperty(False)
+    target = StringProperty("")
+
+
+class SoftBar(Widget):
+    value = NumericProperty(0)
+
+
+class StatBox(BoxLayout):
+    value = StringProperty("0")
+    caption = StringProperty("")
+    accent = ListProperty([0.31, 0.275, 0.90, 1])
+
+
+class IpRow(BoxLayout):
+    ip = StringProperty("")
+    meta = StringProperty("")
+    score = NumericProperty(0)
+
+
+class DeployRow(Card):
+    title = StringProperty("")
+    subtitle = StringProperty("")
+    index = NumericProperty(0)
+
+
+class LogBar(ButtonBehavior, BoxLayout):
+    last = StringProperty("Ready.")
+
+
+class ToastLabel(Label):
+    pass
+
+
+class GradientBox(BoxLayout):
+    c1 = ListProperty(C_PRIMARY)
+    c2 = ListProperty(C_CYAN)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bind(pos=self._draw, size=self._draw, c1=self._draw, c2=self._draw)
+        self._draw()
+
+    def _draw(self, *_):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(1, 1, 1, 1)
+            Rectangle(pos=self.pos, size=self.size, texture=gradient_texture(self.c1, self.c2, vertical=False))
+
+
+class Radar(FloatLayout):
+    """Animated radar. While a scan runs the sweep spins fast; every probed IP appears as a blip:
+    clean IPs stay as glowing green dots with a pulse ring, failed probes flash red and fade."""
+    title = StringProperty("STANDBY")
+    subtitle = StringProperty("Press Start scan")
+    active = BooleanProperty(False)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._angle = 90.0
+        self._t = 0.0
+        self._blips = []
+        self._known = set()
+        Clock.schedule_interval(self._tick, 1 / 30.0)
+
+    def reset(self):
+        self._blips = []
+        self._known = set()
+
+    def feed(self, recent):
+        for ip, ok in recent:
+            if ip in self._known:
+                continue
+            self._known.add(ip)
+            h = zlib.crc32(ip.encode())
+            self._blips.append({"a": h % 360, "r": 0.16 + 0.80 * (((h >> 9) % 1000) / 1000.0), "ok": ok, "age": 0.0})
+        good = [b for b in self._blips if b["ok"]]
+        if len(good) > 140:
+            drop = set(map(id, good[: len(good) - 140]))
+            self._blips = [b for b in self._blips if id(b) not in drop]
+
+    def _tick(self, dt):
+        if self.get_root_window() is None or self.width < 10:
+            return
+        self._t += dt
+        self._angle = (self._angle - (150.0 if self.active else 28.0) * dt) % 360
+        for b in self._blips:
+            b["age"] += dt
+        self._blips = [b for b in self._blips if b["ok"] or b["age"] < 1.6]
+        self._draw()
+
+    def _draw(self):
+        c = self.canvas.before
+        c.clear()
+        rad = math.radians
+        with c:
+            Color(0.043, 0.063, 0.125, 1)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(24)])
+            cx, cy = self.center
+            R = min(self.width, self.height) / 2 - dp(34)
+            Color(0.20, 0.85, 0.70, 0.09)
+            Ellipse(pos=(cx - R, cy - R), size=(2 * R, 2 * R))
+            Color(0.25, 0.90, 0.75, 0.32)
+            for k in (1.0, 0.75, 0.5, 0.25):
+                Line(circle=(cx, cy, R * k), width=dp(0.9))
+            Color(0.25, 0.90, 0.75, 0.16)
+            Line(points=[cx - R, cy, cx + R, cy], width=dp(0.8))
+            Line(points=[cx, cy - R, cx, cy + R], width=dp(0.8))
+            # sweep with fading trail
+            steps, span = 26, 72.0
+            for i in range(steps):
+                a0 = rad(self._angle + i * span / steps)
+                a1 = rad(self._angle + (i + 1) * span / steps)
+                Color(0.20, 1.0, 0.75, (0.36 if self.active else 0.22) * (1 - i / steps) ** 1.7)
+                Triangle(points=[cx, cy, cx + R * math.cos(a0), cy + R * math.sin(a0),
+                                 cx + R * math.cos(a1), cy + R * math.sin(a1)])
+            a = rad(self._angle)
+            Color(0.65, 1.0, 0.92, 0.95)
+            Line(points=[cx, cy, cx + R * math.cos(a), cy + R * math.sin(a)], width=dp(1.6))
+            # blips
+            oks = [b for b in self._blips if b["ok"]]
+            pulsing = set(map(id, oks[-25:]))
+            for b in self._blips:
+                ang = rad(b["a"])
+                x = cx + R * b["r"] * math.cos(ang)
+                y = cy + R * b["r"] * math.sin(ang)
+                if b["ok"]:
+                    if id(b) in pulsing:
+                        p = (self._t * 1.5 + b["a"] / 360.0) % 1
+                        Color(0.30, 1.0, 0.60, 0.55 * (1 - p))
+                        Line(circle=(x, y, dp(4) + dp(15) * p), width=dp(1))
+                    Color(0.45, 1.0, 0.65, 1)
+                    Ellipse(pos=(x - dp(3.5), y - dp(3.5)), size=(dp(7), dp(7)))
+                else:
+                    fade = max(0.0, 1 - b["age"] / 1.6)
+                    Color(1.0, 0.35, 0.40, 0.55 * fade)
+                    Ellipse(pos=(x - dp(2.2), y - dp(2.2)), size=(dp(4.4), dp(4.4)))
+            Color(0.65, 1.0, 0.92, 1)
+            Ellipse(pos=(cx - dp(3), cy - dp(3)), size=(dp(6), dp(6)))
+
+
+class Ring(FloatLayout):
+    """Circular progress. Spins while busy with no progress yet, otherwise shows value (0..1)."""
+    value = NumericProperty(0)
+    busy = BooleanProperty(False)
+    text = StringProperty("")
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._rot = 0.0
+        self.bind(pos=self._draw, size=self._draw, value=self._draw, busy=self._draw)
+        Clock.schedule_interval(self._spin, 1 / 30.0)
+        self._draw()
+
+    def _spin(self, dt):
+        if self.busy and self.value <= 0.01 and self.get_root_window() is not None:
+            self._rot = (self._rot + 330 * dt) % 360
+            self._draw()
+
+    def _draw(self, *_):
+        c = self.canvas.before
+        c.clear()
+        with c:
+            cx, cy = self.center
+            r = min(self.size) / 2 - dp(10)
+            w = dp(9)
+            Color(0.90, 0.92, 0.97, 1)
+            Line(circle=(cx, cy, r), width=w)
+            Color(*C_PRIMARY)
+            if self.busy and self.value <= 0.01:
+                Line(circle=(cx, cy, r, self._rot, self._rot + 100), width=w, cap="round")
+            elif self.value > 0.005:
+                Line(circle=(cx, cy, r, 0, 360 * min(1.0, self.value)), width=w, cap="round")
+
+
+class Splash(FloatLayout):
+    """Full-screen animated intro that fades out by itself."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._t = 0.0
+        self._tex = gradient_texture(C_PRIMARY, C_CYAN, vertical=True)
+        self._logo = Label(text="A", bold=True, font_size="46sp", size_hint=(None, None),
+                           size=(dp(96), dp(96)), pos_hint={"center_x": .5, "center_y": .58})
+        self._name = Label(text="AMINIUM STUDIO", bold=True, font_size="24sp", size_hint=(None, None),
+                           size=(dp(300), dp(40)), pos_hint={"center_x": .5, "center_y": .43})
+        self._tag = Label(text="Clean IPs. One tap panels.", font_size="13sp", color=(1, 1, 1, .85),
+                          size_hint=(None, None), size=(dp(300), dp(30)), pos_hint={"center_x": .5, "center_y": .385})
+        for w in (self._logo, self._name, self._tag):
+            self.add_widget(w)
+        self._ev = Clock.schedule_interval(self._tick, 1 / 30.0)
+        Clock.schedule_once(self.dismiss, 2.3)
+
+    def on_touch_down(self, touch):
+        return True
+
+    def on_touch_move(self, touch):
+        return True
+
+    def on_touch_up(self, touch):
+        return True
+
+    def _tick(self, dt):
+        self._t += dt
+        c = self.canvas.before
+        c.clear()
+        with c:
+            Color(1, 1, 1, 1)
+            Rectangle(pos=self.pos, size=self.size, texture=self._tex)
+            cx, cy = self.width / 2, self.height * 0.58
+            for k in range(3):
+                p = (self._t * 0.55 + k / 3.0) % 1
+                Color(1, 1, 1, 0.30 * (1 - p))
+                Line(circle=(cx, cy, dp(50) + dp(120) * p), width=dp(1.4))
+            Color(1, 1, 1, 0.22)
+            RoundedRectangle(pos=(cx - dp(48), cy - dp(48)), size=(dp(96), dp(96)), radius=[dp(30)])
+            bw = dp(180)
+            bx, by = cx - bw / 2, self.height * 0.30
+            Color(1, 1, 1, 0.28)
+            RoundedRectangle(pos=(bx, by), size=(bw, dp(5)), radius=[dp(3)])
+            Color(1, 1, 1, 0.95)
+            RoundedRectangle(pos=(bx, by), size=(max(dp(5), bw * min(1.0, self._t / 2.1)), dp(5)), radius=[dp(3)])
+
+    def dismiss(self, *_):
+        a = Animation(opacity=0, duration=0.5)
+
+        def done(*_):
+            self._ev.cancel()
+            if self.parent:
+                self.parent.remove_widget(self)
+        a.bind(on_complete=done)
+        a.start(self)
 
 
 class TokenScreen(Screen):
@@ -490,51 +1099,17 @@ class ManageScreen(Screen):
     pass
 
 
-class DeploymentRow(BoxLayout):
-    def __init__(self, rec, index, app, **kw):
-        super().__init__(orientation="vertical", size_hint_y=None, padding=10, spacing=4, **kw)
-        self.height = 110
-        from kivy.uix.label import Label
-        from kivy.uix.button import Button
-        from kivy.graphics import Color, RoundedRectangle
-        with self.canvas.before:
-            Color(0.071, 0.102, 0.212, 1)
-            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[10])
-        self.bind(pos=self._update_bg, size=self._update_bg)
-        title = rec.get("label") or rec.get("project", "(unnamed)")
-        lbl = Label(text=f"[b]{title}[/b]\n{rec.get('base', '')}\ncreated: {rec.get('created', '')}  |  {len(rec.get('ips', []))} clean IPs",
-                    markup=True, halign="left", valign="top", size_hint_y=None, height=64, font_size="12sp")
-        lbl.bind(size=lambda i, v: setattr(i, "text_size", (i.width, None)))
-        self.add_widget(lbl)
-        row = BoxLayout(size_hint_y=None, height=34, spacing=6)
-        b1 = Button(text="Load", on_release=lambda *_: app.load_deployment(index))
-        b2 = Button(text="Rename", on_release=lambda *_: app.rename_deployment_prompt(index))
-        b3 = Button(text="Delete", on_release=lambda *_: app.delete_deployment_prompt(index))
-        row.add_widget(b1)
-        row.add_widget(b2)
-        row.add_widget(b3)
-        self.add_widget(row)
-
-    def _update_bg(self, *_):
-        self._bg.pos = self.pos
-        self._bg.size = self.size
-
-
-FORMATS_UI = [
-    ("auto", "Auto (recommended)", ""),
-    ("xray", "Xray + fragment", "?format=xray"),
-    ("clash", "Clash", "?format=clash"),
-    ("singbox", "sing-box", "?format=singbox"),
-    ("patt", "Patt", "?format=patt"),
-    ("v2ray", "Plain links", "?format=base64"),
-]
-
-
+# ───────────────────────────── the app ─────────────────────────────
 class AminiumApp(App):
     title = "Aminium Studio"
 
     def build(self):
-        Window.clearcolor = (0.039, 0.055, 0.122, 1)
+        Window.clearcolor = (0.957, 0.965, 0.984, 1)
+        try:
+            Window.softinput_mode = "below_target"      # keyboard pushes the focused field up
+        except Exception:
+            pass
+        self._ready = False
         self.cfg = self.load_cfg()
         self.token = self.cfg.get("token", "")
         self.email = self.cfg.get("email", "")
@@ -545,19 +1120,33 @@ class AminiumApp(App):
         self.rec = None
         self.out = None
         self.cur_fmt = "auto"
+        self.log_lines = []
+        self._shown_found = -1
         self.deployments = core.load_deployments()
+
         root = Builder.load_string(KV)
+        self.root_widget = root
         self.sm = root.ids.sm
-        self.logbox = root.ids.logbox
-        self.sm.add_widget(TokenScreen())
-        self.sm.add_widget(ScanScreen())
-        self.sm.add_widget(BuildScreen())
-        self.sm.add_widget(OutputScreen())
-        self.sm.add_widget(ManageScreen())
+        self.sm.transition = SlideTransition(duration=0.22)
+        self.logbar = root.ids.logbar
+        self.hdr_sub = root.ids.hdr_sub
+        for scr in (TokenScreen(), ScanScreen(), BuildScreen(), OutputScreen(), ManageScreen()):
+            self.sm.add_widget(scr)
+
+        self.tabs = {}
+        for name, label, _sub in TABS:
+            tab = NavTab(text=label, target=name)
+            tab.bind(on_release=lambda t: self.goto(t.target))
+            root.ids.nav.add_widget(tab)
+            self.tabs[name] = tab
+
+        root.add_widget(Splash())
+        self._ready = True
+        self.goto("token", animate=False)
         Clock.schedule_once(lambda dt: self.init_fields(), 0)
         return root
 
-    # ---------- small helpers ----------
+    # ---------- helpers ----------
     def cfg_path(self):
         return core.APP_DIR / "aminium_studio_config.json"
 
@@ -578,32 +1167,116 @@ class AminiumApp(App):
 
     def log(self, msg):
         def ui(*_):
-            self.logbox.text = (self.logbox.text + "\n" + str(msg))[-4000:]
+            line = str(msg)
+            self.log_lines.append(line)
+            self.log_lines = self.log_lines[-300:]
+            self.logbar.last = line.replace("\n", " ")
+            if line.startswith("ERROR"):
+                self.toast(line[:90])
         Clock.schedule_once(ui, 0)
 
-    def goto(self, name):
+    def toast(self, text):
+        t = ToastLabel(text=text, opacity=0)
+        self.root_widget.add_widget(t)
+        anim = Animation(opacity=1, duration=0.15) + Animation(opacity=1, duration=1.7) + Animation(opacity=0, duration=0.4)
+        anim.bind(on_complete=lambda *_: self.root_widget.remove_widget(t))
+        anim.start(t)
+
+    def show_log(self):
+        box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
+        from kivy.uix.scrollview import ScrollView
+        sv = ScrollView(bar_width=dp(3))
+        lab = Label(text="\n".join(self.log_lines) or "(empty)", color=C_TEXT, font_size="11sp",
+                    size_hint_y=None, halign="left", valign="top")
+        lab.bind(width=lambda i, w: setattr(i, "text_size", (w, None)),
+                 texture_size=lambda i, s: setattr(i, "height", s[1]))
+        sv.add_widget(lab)
+        box.add_widget(sv)
+        btn = RoundButton(text="Close", height=dp(44))
+        box.add_widget(btn)
+        pop = self.make_popup("Activity log", box, (0.94, 0.8))
+        btn.bind(on_release=lambda *_: pop.dismiss())
+        pop.open()
+
+    def make_popup(self, title, content, size_hint):
+        return Popup(title=title, content=content, size_hint=size_hint, background="",
+                     background_color=(1, 1, 1, 1), title_color=C_TEXT, separator_color=C_PRIMARY)
+
+    def set_status(self, label, text, kind="info"):
+        label.text = text
+        label.color = {"ok": C_OK, "err": C_ERR}.get(kind, C_MUTED)
+
+    def open_url(self, url):
+        try:
+            if platform == "android":
+                from jnius import autoclass  # type: ignore
+                Intent = autoclass("android.content.Intent")
+                Uri = autoclass("android.net.Uri")
+                Activity = autoclass("org.kivy.android.PythonActivity")
+                Activity.mActivity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            else:
+                import webbrowser
+                webbrowser.open(url)
+            return True
+        except Exception as e:
+            from kivy.core.clipboard import Clipboard
+            Clipboard.copy(url)
+            self.log(f"Could not open the browser ({e}). The link was copied - paste it into your browser.")
+            return False
+
+    def goto(self, name, animate=True):
+        order = [t[0] for t in TABS]
+        cur = self.sm.current if self.sm.screen_names else name
+        if animate and name != cur and cur in order:
+            self.sm.transition.direction = "left" if order.index(name) > order.index(cur) else "right"
         self.sm.current = name
+        for n, tab in self.tabs.items():
+            tab.active = (n == name)
+        self.hdr_sub.text = next(t[2] for t in TABS if t[0] == name)
         if name == "manage":
             self.refresh_manage_list()
         if name == "build":
             self.refresh_build_summary()
+
+    def find_default_zip(self):
+        dirs = [core.APP_DIR, Path(core.__file__).resolve().parent, Path(__file__).resolve().parent, Path.cwd()]
+        for d in dirs:
+            p = d / "aminium-pages.zip"
+            if p.exists():
+                return str(p)
+        return ""
 
     def init_fields(self):
         t = self.sm.get_screen("token")
         t.ids.f_token.text = self.token
         t.ids.f_email.text = self.email
         if self.token:
-            t.ids.lbl_token_state.text = "Token loaded from this phone's storage. Press 'Save & verify'."
+            self.set_status(t.ids.lbl_token_state, "Token loaded from this phone. Press 'Save & verify'.")
         self.roll_all()
 
     # ---------- step 1: token ----------
+    def open_token_page(self, manual=False):
+        url = core.TOKEN_URL if manual else core.token_template_url()
+        if self.open_url(url):
+            self.toast("Opening Cloudflare...")
+            self.log("Cloudflare token page opened. Press Continue -> Create Token, then copy the token.")
+
+    def paste_token(self):
+        from kivy.core.clipboard import Clipboard
+        txt = (Clipboard.paste() or "").strip()
+        if txt:
+            self.sm.get_screen("token").ids.f_token.text = txt
+            self.toast("Pasted")
+        else:
+            self.toast("Clipboard is empty")
+
     def on_save_token(self):
         t = self.sm.get_screen("token")
         tok = t.ids.f_token.text.strip()
         if not tok:
-            return self.log("Paste the API token first.")
+            return self.log("ERROR: paste the API token first.")
         self.token, self.email = tok, t.ids.f_email.text.strip()
-        t.ids.lbl_token_state.text = "Checking the token..."
+        self.set_status(t.ids.lbl_token_state, "Checking the token...")
 
         def work():
             try:
@@ -619,15 +1292,16 @@ class AminiumApp(App):
                     t.ids.sp_account.values = vals
                     t.ids.sp_account.text = vals[0]
                     self.token_ok = True
-                    t.ids.lbl_token_state.text = f"Token is valid ({info.get('status')}). Go to step 2."
+                    self.set_status(t.ids.lbl_token_state, f"Token is valid ({info.get('status')}). Continue to the Radar tab.", "ok")
                     self.save_cfg()
+                    self.toast("Token verified")
                 Clock.schedule_once(ui, 0)
             except Exception as e:
                 self.log(f"Token check failed: {e}")
 
                 def ui2(*_):
                     self.token_ok = False
-                    t.ids.lbl_token_state.text = f"Token check failed: {e}"
+                    self.set_status(t.ids.lbl_token_state, f"Token check failed: {e}", "err")
                 Clock.schedule_once(ui2, 0)
         threading.Thread(target=work, daemon=True).start()
 
@@ -639,11 +1313,11 @@ class AminiumApp(App):
         t.ids.f_email.text = ""
         t.ids.sp_account.values = ["(verify token first)"]
         t.ids.sp_account.text = "(verify token first)"
-        t.ids.lbl_token_state.text = ""
+        self.set_status(t.ids.lbl_token_state, "")
         self.save_cfg()
         self.log("Token removed from this phone.")
 
-    # ---------- step 2: scan ----------
+    # ---------- step 2: scan (radar) ----------
     def scan_form(self):
         s = self.sm.get_screen("scan")
         tls = s.ids.sp_conn.text == "TLS"
@@ -662,13 +1336,24 @@ class AminiumApp(App):
         cfg = core.Config.from_dict(self.scan_form())
         self.job = core.ScanJob(cfg, self.log)
         job = self.job
+        self._shown_found = -1
+        s.ids.radar.reset()
+        s.ids.radar.active = True
+        s.ids.radar.title = "SCANNING"
+        s.ids.radar.subtitle = "0 clean IPs found"
+        s.ids.pb_scan.value = 0
         s.ids.btn_scan.disabled = True
         s.ids.btn_scan.text = "Scanning..."
         s.ids.btn_stop.disabled = False
+        s.ids.lbl_ip_empty.text = "Searching..."
+        s.ids.ip_list.clear_widgets()
         Clock.schedule_once(lambda dt: self.poll_scan(), 0.3)
 
         def go():
-            job.run()
+            try:
+                job.run()
+            except Exception as e:
+                self.log(f"ERROR: scan crashed: {e}")
             Clock.schedule_once(lambda dt: self.scan_finished(), 0)
         threading.Thread(target=go, daemon=True).start()
 
@@ -677,28 +1362,69 @@ class AminiumApp(App):
             self.job.stop.set()
             self.log("Stopping...")
 
+    PHASE_TITLES = {"diagnosing": "CHECKING NETWORK", "scanning": "SCANNING", "speed": "SPEED TEST",
+                    "finishing": "FINISHING", "done": "COMPLETE", "stopped": "STOPPED", "idle": "STARTING"}
+
     def poll_scan(self):
         job = self.job
         if not job:
             return
         s = self.sm.get_screen("scan")
         snap = job.snapshot()
-        s.ids.lbl_scan_stats.text = f"{snap['phase']}  -  {snap['tested']}/{snap['total']}  -  {snap['elapsed']}s  -  {snap['found']} found"
-        if snap["total"]:
-            s.ids.pb_scan.value = min(1.0, snap["tested"] / snap["total"])
+        self.update_scan_ui(s, snap)
         if snap["phase"] in ("diagnosing", "scanning", "speed", "finishing", "idle"):
-            Clock.schedule_once(lambda dt: self.poll_scan(), 0.5)
+            Clock.schedule_once(lambda dt: self.poll_scan(), 0.4)
+
+    def update_scan_ui(self, s, snap):
+        radar = s.ids.radar
+        radar.feed(snap.get("recent", []))
+        radar.title = self.PHASE_TITLES.get(snap["phase"], snap["phase"].upper())
+        radar.subtitle = f"{snap['found']} clean IPs found"
+        s.ids.st_tested.value = f"{snap['tested']}/{snap['total']}" if snap["total"] else str(snap["tested"])
+        s.ids.st_found.value = str(snap["found"])
+        s.ids.st_time.value = str(int(snap["elapsed"]))
+        s.ids.lbl_scan_stats.text = f"{snap['phase']}  -  {snap['tested']} of {snap['total']} tested"
+        if snap["total"]:
+            target = min(1.0, snap["tested"] / snap["total"])
+            Animation(value=target, duration=0.35).start(s.ids.pb_scan)
+        if snap["found"] != self._shown_found:
+            self._shown_found = snap["found"]
+            self.fill_ip_rows(s, snap["results"], limit=8)
+
+    def fill_ip_rows(self, s, results, limit=60):
+        box = s.ids.ip_list
+        box.clear_widgets()
+        ordered = sorted(results, key=lambda r: -r["score"])[:limit]
+        s.ids.lbl_ip_empty.text = "" if ordered else "(none yet)"
+        for r in ordered:
+            meta = f"{r.get('colo') or '--'}   |   {r.get('total', '?')} ms   |   jitter {r.get('jitter', '?')}"
+            box.add_widget(IpRow(ip=r["ip"], meta=meta, score=int(r["score"])))
 
     def scan_finished(self):
         s = self.sm.get_screen("scan")
         s.ids.btn_scan.disabled = False
-        s.ids.btn_scan.text = "\u25b6  Start scan"
+        s.ids.btn_scan.text = "Start scan"
         s.ids.btn_stop.disabled = True
-        snap = self.job.snapshot() if self.job else {"results": []}
+        s.ids.radar.active = False
+        snap = self.job.snapshot() if self.job else {"results": [], "phase": "done", "tested": 0, "total": 0,
+                                                       "found": 0, "elapsed": 0, "recent": []}
+        self.update_scan_ui(s, snap)
         results = sorted(snap["results"], key=lambda r: -r["score"])
         self.ips = [r["ip"] for r in results]
-        s.ids.lbl_ip_list.text = "\n".join(f"{r['ip']}  score={r['score']}  {r.get('colo', '')}" for r in results[:60]) or "nothing found - see the log"
+        self.fill_ip_rows(s, results, limit=60)
+        if not results:
+            s.ids.lbl_ip_empty.text = "Nothing found - see the log (tap the bar above the tabs)."
+        s.ids.pb_scan.value = 1.0
+        s.ids.radar.title = "COMPLETE" if results else "NO RESULT"
         self.log(f"Finished: {len(self.ips)} clean IPs.")
+        self.toast(f"{len(self.ips)} clean IPs found")
+
+    def copy_ips(self):
+        if not self.ips:
+            return self.toast("No IPs yet")
+        from kivy.core.clipboard import Clipboard
+        Clipboard.copy("\n".join(self.ips))
+        self.toast("IPs copied")
 
     # ---------- step 3: build ----------
     def roll_all(self):
@@ -709,33 +1435,60 @@ class AminiumApp(App):
         self._ws_path = "/stream/" + core.rnd(18, core.LOWER)
         self._cron = core.rnd(24)
         self._uuid = str(uuidlib.uuid4())
-        default_zip = core.APP_DIR / "aminium-pages.zip"
-        if not b.ids.f_source.text and default_zip.exists():
-            b.ids.f_source.text = str(default_zip)
+        if not b.ids.f_source.text:
+            b.ids.f_source.text = self.find_default_zip()
 
     def pick_source_file(self):
-        self.log("On Android, place aminium-pages.zip in the app's data folder, or wire a file picker here "
-                  "(plyer.filechooser) for the person to browse to it.")
+        found = self.find_default_zip()
+        b = self.sm.get_screen("build")
+        if found and not b.ids.f_source.text:
+            b.ids.f_source.text = found
+            return self.toast("Found aminium-pages.zip")
+        try:
+            from kivy.uix.filechooser import FileChooserListView
+            start = next((p for p in ("/storage/emulated/0/Download", "/sdcard/Download", str(core.APP_DIR),
+                                      os.path.expanduser("~")) if os.path.isdir(p)), "/")
+            box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(6))
+            fc = FileChooserListView(path=start, filters=["*.zip"])
+            box.add_widget(fc)
+            row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+            ok = RoundButton(text="Select")
+            cancel = RoundButton(text="Cancel", kind="soft")
+            row.add_widget(ok)
+            row.add_widget(cancel)
+            box.add_widget(row)
+            pop = self.make_popup("Choose aminium-pages.zip", box, (0.95, 0.85))
+
+            def choose(*_):
+                if fc.selection:
+                    b.ids.f_source.text = fc.selection[0]
+                pop.dismiss()
+            ok.bind(on_release=choose)
+            cancel.bind(on_release=lambda *_: pop.dismiss())
+            pop.open()
+        except Exception as e:
+            self.log(f"File picker unavailable ({e}). Bundle aminium-pages.zip next to main.py when building the APK.")
 
     def refresh_build_summary(self):
         b = self.sm.get_screen("build")
         n = len(self.ips)
         tls = self.sm.get_screen("scan").ids.sp_conn.text == "TLS"
         ports = len(core.TLS_PORTS if tls else core.PLAIN_PORTS)
-        b.ids.lbl_build_sum.text = (f"{n} clean IPs (+ your worker's own address)  x  {ports} ports  x  2 protocols\n"
-                                     f"= up to {(n + 1) * ports * 2} configs\nConnection: {'TLS' if tls else 'No TLS'}")
+        b.ids.lbl_build_sum.text = (f"{n} clean IPs (+ your worker's own address)  x  {ports} ports  x  2 protocols"
+                                    f"  =  up to {(n + 1) * ports * 2} configs.   Connection: {'TLS' if tls else 'No TLS'}")
 
     def on_build(self):
         b = self.sm.get_screen("build")
         project = b.ids.f_project.text.strip().lower()
         source = b.ids.f_source.text.strip()
+        if not self.token:
+            return self.log("ERROR: add and verify your Cloudflare token first (Token tab).")
         if not self.ips:
-            return self.log("ERROR: no clean IPs yet - run step 2 first.")
+            return self.log("ERROR: no clean IPs yet - run the Radar scan first.")
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,56}", project or ""):
             return self.log("ERROR: project name: lowercase letters, digits and '-' only.")
-        import pathlib
-        if not source or not pathlib.Path(source).exists():
-            return self.log("ERROR: source zip not found - pick aminium-pages.zip first.")
+        if not source or not Path(source).exists():
+            return self.log("ERROR: source zip not found - tap Pick, or bundle aminium-pages.zip in the APK.")
         if not b.ids.f_pass.text:
             return self.log("ERROR: ADMIN_PASSWORD is empty.")
         panel = b.ids.f_panel.text.strip()
@@ -751,34 +1504,41 @@ class AminiumApp(App):
         }
         b.ids.btn_build.disabled = True
         b.ids.btn_build.text = "Building..."
-        b.ids.pb_build.value = 0
+        b.ids.ring.value = 0
+        b.ids.ring.busy = True
+        b.ids.ring.text = ""
 
         def stage(text, frac):
             def ui(*_):
                 b.ids.lbl_build_stage.text = text
-                b.ids.pb_build.value = frac
+                b.ids.ring.text = f"{int(frac * 100)}%"
+                Animation(value=frac, duration=0.4).start(b.ids.ring)
             Clock.schedule_once(ui, 0)
+
+        def reset_button(msg=None):
+            b.ids.btn_build.disabled = False
+            b.ids.btn_build.text = "Build my configs"
+            b.ids.ring.busy = False
+            if msg:
+                b.ids.lbl_build_stage.text = msg
 
         def work():
             try:
-                result = core.run_build(self.token, self.email, self.accounts, None, project, source, panel, mode, form, self.log, stage)
+                result = core.run_build(self.token, self.email, self.accounts, None, project, source, panel, mode,
+                                        form, self.log, stage)
                 self.rec, self.out = result["rec"], result["out"]
                 self.deployments = core.add_deployment(self.rec)
 
                 def ui(*_):
-                    b.ids.btn_build.disabled = False
-                    b.ids.btn_build.text = "\u26a1  Build my configs"
+                    reset_button("Done!")
+                    b.ids.ring.text = "100%"
+                    Animation(value=1.0, duration=0.3).start(b.ids.ring)
                     self.render_output()
                     self.goto("output")
                 Clock.schedule_once(ui, 0)
             except Exception as e:
                 self.log(f"ERROR: {e}")
-
-                def ui2(*_):
-                    b.ids.btn_build.disabled = False
-                    b.ids.btn_build.text = "\u26a1  Build my configs"
-                    b.ids.lbl_build_stage.text = "Something went wrong - see the log."
-                Clock.schedule_once(ui2, 0)
+                Clock.schedule_once(lambda dt: reset_button("Something went wrong - tap the log bar for details."), 0)
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- step 4: configs ----------
@@ -789,28 +1549,32 @@ class AminiumApp(App):
             return
         n = len(self.out["links"]) if self.out else 0
         o.ids.lbl_out_info.text = (f"{n} configs  -  {len(self.rec.get('ips', []))} clean IPs\n"
-                                    f"Panel:    {self.rec['base']}{self.rec['panel_path']}\nPassword: {self.rec['password']}")
+                                   f"Panel:  {self.rec['base']}{self.rec['panel_path']}\nPassword:  {self.rec['password']}")
         self.on_pick_fmt(o.ids.sp_fmt.text)
 
     def on_pick_fmt(self, label):
-        o = self.sm.get_screen("output")
+        if not getattr(self, "_ready", False):
+            return
+        try:
+            o = self.sm.get_screen("output")
+        except Exception:
+            return
         key, _, q = next((x for x in FORMATS_UI if x[1] == label), FORMATS_UI[0])
         self.cur_fmt = key
         if not self.out:
             o.ids.f_sub_url.text = ""
             o.ids.f_preview.text = "No configs available yet."
             return
-        if key == "auto":
-            o.ids.f_sub_url.text = self.out["sub"]
-        else:
-            o.ids.f_sub_url.text = self.out["sub"] + q
+        o.ids.f_sub_url.text = self.out["sub"] + ("" if key == "auto" else q)
         o.ids.f_preview.text = (self.out["text"].get(key) or "(empty)")[:4000]
 
     def copy_sub_url(self):
         o = self.sm.get_screen("output")
+        if not o.ids.f_sub_url.text:
+            return self.toast("Nothing to copy yet")
         from kivy.core.clipboard import Clipboard
         Clipboard.copy(o.ids.f_sub_url.text)
-        self.log("Copied.")
+        self.toast("Link copied")
 
     def save_all_configs(self):
         if not (self.rec and self.out):
@@ -818,25 +1582,29 @@ class AminiumApp(App):
         try:
             folder = core.save_all(self.rec, self.out, self.log)
             self.log(f"Saved to {folder}")
+            self.toast("Saved on this phone")
         except Exception as e:
             self.log(f"ERROR: save failed: {e}")
 
-    # ---------- "My configs" management screen (the new feature) ----------
+    # ---------- "Saved" screen ----------
     def refresh_manage_list(self):
         m = self.sm.get_screen("manage")
         box = m.ids.manage_list
         box.clear_widgets()
         self.deployments = core.load_deployments()
         if not self.deployments:
-            from kivy.uix.label import Label
-            box.add_widget(Label(text="No configs built yet.", size_hint_y=None, height=40))
+            box.add_widget(Card_empty())
             return
+        total = len(self.deployments)
         for i, rec in enumerate(reversed(self.deployments)):
-            real_index = len(self.deployments) - 1 - i
-            box.add_widget(DeploymentRow(rec, real_index, self))
+            real_index = total - 1 - i
+            title = rec.get("label") or rec.get("project", "(unnamed)")
+            sub = f"{rec.get('base', '')}\ncreated {rec.get('created', '')}   |   {len(rec.get('ips', []))} clean IPs"
+            box.add_widget(DeployRow(title=title, subtitle=sub, index=real_index))
 
     def load_deployment(self, index):
         items = core.load_deployments()
+        index = int(index)
         if not (0 <= index < len(items)):
             return
         rec = items[index]
@@ -859,16 +1627,15 @@ class AminiumApp(App):
 
     def rename_deployment_prompt(self, index):
         items = core.load_deployments()
+        index = int(index)
         if not (0 <= index < len(items)):
             return
-        content = BoxLayout(orientation="vertical", padding=10, spacing=10)
-        from kivy.uix.textinput import TextInput
-        from kivy.uix.button import Button
-        ti = TextInput(text=items[index].get("label") or items[index].get("project", ""), multiline=False, size_hint_y=None, height=44)
+        content = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(12))
+        ti = RoundInput(text=items[index].get("label") or items[index].get("project", ""))
         content.add_widget(ti)
-        btn = Button(text="Save", size_hint_y=None, height=44)
+        btn = RoundButton(text="Save")
         content.add_widget(btn)
-        popup = Popup(title="Rename this config", content=content, size_hint=(0.85, 0.35))
+        popup = self.make_popup("Rename this config", content, (0.88, 0.34))
 
         def do_save(*_):
             core.rename_deployment(items, index, ti.text.strip() or items[index].get("project", ""))
@@ -879,20 +1646,20 @@ class AminiumApp(App):
 
     def delete_deployment_prompt(self, index):
         items = core.load_deployments()
+        index = int(index)
         if not (0 <= index < len(items)):
             return
-        content = BoxLayout(orientation="vertical", padding=10, spacing=10)
-        from kivy.uix.label import Label
-        from kivy.uix.button import Button
-        content.add_widget(Label(text=f"Delete \"{items[index].get('label') or items[index]['project']}\" from this list?\n"
-                                       "(The Cloudflare project itself is NOT touched.)"))
-        row = BoxLayout(size_hint_y=None, height=44, spacing=8)
-        b_yes = Button(text="Delete")
-        b_no = Button(text="Cancel")
+        content = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(12))
+        name = items[index].get("label") or items[index].get("project", "")
+        content.add_widget(Label(text=f"Remove \"{name}\" from this list?\n(The Cloudflare project itself is NOT touched.)",
+                                 color=C_TEXT, font_size="13sp", halign="center"))
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        b_yes = RoundButton(text="Delete", kind="danger")
+        b_no = RoundButton(text="Cancel", kind="soft")
         row.add_widget(b_yes)
         row.add_widget(b_no)
         content.add_widget(row)
-        popup = Popup(title="Confirm delete", content=content, size_hint=(0.85, 0.4))
+        popup = self.make_popup("Confirm delete", content, (0.88, 0.38))
 
         def do_delete(*_):
             core.delete_deployment(items, index, log=self.log, also_remove_remote=False)
@@ -901,6 +1668,13 @@ class AminiumApp(App):
         b_yes.bind(on_release=do_delete)
         b_no.bind(on_release=lambda *_: popup.dismiss())
         popup.open()
+
+
+def Card_empty():
+    c = Card()
+    lab = Label(text="No configs built yet.", color=C_MUTED, size_hint_y=None, height=dp(40))
+    c.add_widget(lab)
+    return c
 
 
 if __name__ == "__main__":
