@@ -2,7 +2,7 @@
 android.add_libs_arm64_v8a = libs/arm64-v8a/*.so
 android.extra_manifest_application_arguments = ./manifest_app.xml
 android.add_src = java
-p4a.branch = v2024.01.21
+p4a.branch = master
 title = Aminium Studio
 package.name = aminiumstudio
 package.domain = org.aminium
