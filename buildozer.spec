@@ -8,7 +8,7 @@ package.name = aminiumstudio
 package.domain = org.aminium
 
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,zip,json,txt,md
+source.include_exts = py,png,jpg,kv,atlas,zip,json,txt,md,yml
 # put aminium-pages.zip next to main.py before building so it ends up bundled in the APK
 source.include_patterns = aminium-pages.zip
 
